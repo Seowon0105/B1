@@ -8,13 +8,17 @@
 # 권한      : 750 (rwxr-x---)
 # 실행 계정 : agent-admin (cron으로 매분 자동 실행)
 #
-# 실행 환경 : Ubuntu 24.04 LTS (Docker 컨테이너)
+# 실행 환경 : Ubuntu 24.04 LTS (OrbStack VM)
 # =============================================================================
 
 
 # ─────────────────────────────────────────────────────────────
 # [0단계] 변수 설정
 # ─────────────────────────────────────────────────────────────
+
+# cron으로 실행될 때 PATH가 제한적(/usr/bin:/bin)이라
+# ss(/usr/sbin) 등을 못 찾을 수 있어 PATH를 명시
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 APP_NAME="agent-app"
 APP_PORT=15034
@@ -29,9 +33,16 @@ TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 # [1단계] 프로세스 확인 (Health Check)
 #   - agent-app 프로세스가 실행 중인지 확인
 #   - 없으면 에러 로그를 남기고 즉시 종료 (exit 1)
+#
+#   ⚠️ 중요: pgrep -f "agent-app" 를 쓰면 monitor.sh 자신의 경로
+#      (/home/agent-admin/agent-app/bin/monitor.sh)에도 "agent-app"이
+#      들어있어서 자기 자신을 앱으로 오인하는 버그가 생긴다.
+#      → pgrep -x 로 프로세스 "이름"이 정확히 agent-app 인 것만 매칭
+#         (실제 앱의 프로세스명(comm)이 정확히 "agent-app" 임을 확인함)
 # ─────────────────────────────────────────────────────────────
 
-APP_PID="$(pgrep -f "${APP_NAME}" | head -1)"
+# pgrep -x : 프로세스 이름이 정확히 일치하는 것만 찾음 (경로/인자 무시)
+APP_PID="$(pgrep -x "${APP_NAME}" | head -1)"
 
 if [ -z "${APP_PID}" ]; then
     echo "[${TIMESTAMP}] [ERROR] 프로세스 '${APP_NAME}' 가 실행 중이 아닙니다." \
@@ -43,8 +54,7 @@ fi
 # ─────────────────────────────────────────────────────────────
 # [2단계] 포트 확인 (Health Check)
 #   - TCP 15034 포트가 LISTEN 상태인지 확인
-#   - Ubuntu 24.04 도커 환경: ss 명령어 사용 (iproute2 패키지)
-#   - ss 없을 경우 /proc/net/tcp 로 대체
+#   - ss 명령어 사용 (iproute2 패키지), 없으면 /proc/net/tcp 로 대체
 # ─────────────────────────────────────────────────────────────
 
 PORT_CHECK=""
@@ -69,13 +79,38 @@ fi
 # ─────────────────────────────────────────────────────────────
 # [3단계] 방화벽 상태 확인
 #   - UFW 또는 firewalld 활성화 여부 확인
-#   - 도커 환경에서는 UFW가 비활성일 수 있어 WARNING만 출력
-#   - 스크립트는 종료하지 않고 계속 진행
+#   - 방화벽이 비활성이면 WARNING만 출력 (스크립트는 종료하지 않고 계속 진행)
+#
+#   ⚠️ 'ufw status' 는 root 권한이 필요해서, 일반 계정(agent-admin)이
+#      실행하면 빈 값이 나와 "비활성"으로 오판한다.
+#      → 일반 계정도 확인 가능한 방법을 순서대로 시도:
+#         1) systemctl is-active ufw   (서비스 활성 여부)
+#         2) /etc/ufw/ufw.conf 의 ENABLED=yes  (설정 파일 읽기)
+#         3) sudo ufw status           (마지막 수단)
 # ─────────────────────────────────────────────────────────────
 
+check_ufw_active() {
+    # 1) systemctl 로 ufw 서비스 활성 확인 (일반 계정 가능)
+    if command -v systemctl &>/dev/null; then
+        if [ "$(systemctl is-active ufw 2>/dev/null)" = "active" ]; then
+            return 0   # 활성
+        fi
+    fi
+    # 2) 설정 파일에서 ENABLED=yes 확인 (읽기 권한 있을 때)
+    if [ -r /etc/ufw/ufw.conf ]; then
+        if grep -qi "^ENABLED=yes" /etc/ufw/ufw.conf 2>/dev/null; then
+            return 0   # 활성
+        fi
+    fi
+    # 3) sudo 없이 ufw status 시도 (root로 실행될 때만 의미 있음)
+    if [ "$(ufw status 2>/dev/null | awk '/^Status:/{print $2}')" = "active" ]; then
+        return 0
+    fi
+    return 1   # 비활성으로 판단
+}
+
 if command -v ufw &>/dev/null; then
-    UFW_STATE="$(ufw status 2>/dev/null | awk '/^Status:/{print $2}')"
-    if [ "${UFW_STATE}" != "active" ]; then
+    if ! check_ufw_active; then
         echo "[${TIMESTAMP}] [WARNING] UFW 방화벽이 비활성 상태입니다."
     fi
 elif command -v firewall-cmd &>/dev/null; then
